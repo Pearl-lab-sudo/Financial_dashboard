@@ -233,67 +233,34 @@ def load_general_metrics(start_date, end_date):
     try:
         with engine.connect() as conn:
             general_query = text("""
-            WITH first_transactions AS (
-                -- Find each customer's first transaction date
-                SELECT 
-                    COALESCE(p.user_id, ip.user_id) AS user_id,
-                    MIN(t.updated_at) AS first_transaction_date
-                FROM transactions t
-                LEFT JOIN investment_plans ip ON ip.id = t.investment_plan_id
-                LEFT JOIN plans p ON p.id = t.plan_id
-                WHERE t.status = 'success'
-                GROUP BY COALESCE(p.user_id, ip.user_id)
-            ),
-
-            base_data AS (
+            WITH base_data AS (
                 -- Main transaction data with customer and asset information
                 SELECT 
+                    u.id AS customer_id,
+                    u.first_name || ' ' || u.last_name AS customer_name,
                     t.id AS transaction_id,
                     CASE 
                         WHEN t.metadata::text ILIKE '%Monthly maintenance fee deduction%' THEN 'maintenance_fee'
                         ELSE t.tx_type
                     END AS transaction_type,
-                    CASE
-                        WHEN t.investment_plan_id IS NOT NULL THEN a.name
-                        WHEN t.plan_id IS NOT NULL THEN p.plan_option
-                        ELSE NULL
-                    END AS asset_type,
-                    u.id AS customer_id,
-                    u.first_name || ' ' || u.last_name AS customer_name,
-                    ft.first_transaction_date,
-                    TO_CHAR(t.updated_at, 'YYYY-MM') AS transaction_cohort,
-                    TO_CHAR(u.created_at, 'YYYY-MM') AS sign_up_cohort,
-                    EXTRACT(WEEK FROM t.updated_at) AS week_number,
                     t.updated_at AS transaction_date,
                     t.amount AS ghs_amount,
                     t.usd_amount,
-                    t.exchange_rate,
-                    u.created_at AS sign_up_date,
-                    CASE  
-                        WHEN t.investment_plan_id IS NOT NULL THEN ip.plan_option
-                        WHEN t.plan_id IS NOT NULL THEN p.plan_option
-                        ELSE NULL
-                    END AS investment_type,
-                    a.name AS asset_name,
-                    a.maturity_date AS assets_maturity_date,
-                    ip.maturity_date AS investment_maturity_date
+                    t.provider_number AS PN
                 FROM transactions t
                 LEFT JOIN investment_plans ip ON ip.id = t.investment_plan_id
                 LEFT JOIN plans p ON p.id = t.plan_id
                 LEFT JOIN users u ON u.id = COALESCE(p.user_id, ip.user_id)
-                LEFT JOIN first_transactions ft ON ft.user_id = u.id
-                LEFT JOIN assets a ON a.id = ip.asset_id
                 WHERE t.status = 'success' 
                   AND u.restricted = 'false' 
-                  AND t.provider_number != 'Flex Dollar'
             ),
 
             deposits AS (
-                SELECT * FROM base_data WHERE transaction_type = 'deposit'
+                SELECT * FROM base_data WHERE transaction_type IN ('deposit', 'direct_debit')
             ),
 
             withdrawals AS (
-                SELECT * FROM base_data WHERE transaction_type = 'withdrawal'
+                SELECT * FROM base_data WHERE transaction_type = 'withdrawal' AND PN != 'Flex Dollar'
             ),
 
             depositors_summary AS (
@@ -309,35 +276,33 @@ def load_general_metrics(start_date, end_date):
 
             -- Final aggregated metrics
             SELECT
-                COUNT(DISTINCT asset_type) AS asset_type_count,
-
                 -- Deposit metrics
-                COUNT(*) FILTER (WHERE transaction_type = 'deposit') AS deposit_count,
-                SUM(ghs_amount) FILTER (WHERE transaction_type = 'deposit') AS deposit_value_ghs,
-                SUM(usd_amount) FILTER (WHERE transaction_type = 'deposit') AS deposit_value_usd,
+                COUNT(*) FILTER (WHERE transaction_type IN ('deposit', 'direct_debit')) AS deposit_count,
+                SUM(ghs_amount) FILTER (WHERE transaction_type IN ('deposit', 'direct_debit')) AS deposit_value_ghs,
+                SUM(usd_amount) FILTER (WHERE transaction_type IN ('deposit', 'direct_debit')) AS deposit_value_usd,
 
                 -- Withdrawal metrics
-                COUNT(*) FILTER (WHERE transaction_type = 'withdrawal') AS withdrawal_count,
-                SUM(ghs_amount) FILTER (WHERE transaction_type = 'withdrawal') AS withdrawal_value_ghs,
-                SUM(usd_amount) FILTER (WHERE transaction_type = 'withdrawal') AS withdrawal_value_usd,
+                COUNT(*) FILTER (WHERE transaction_type = 'withdrawal' AND PN != 'Flex Dollar') AS withdrawal_count,
+                SUM(ghs_amount) FILTER (WHERE transaction_type = 'withdrawal' AND PN != 'Flex Dollar') AS withdrawal_value_ghs,
+                SUM(usd_amount) FILTER (WHERE transaction_type = 'withdrawal' AND PN != 'Flex Dollar') AS withdrawal_value_usd,
 
                 -- Assets Under Management (Net Position)
-                SUM(ghs_amount) FILTER (WHERE transaction_type = 'deposit') - 
-                    COALESCE(SUM(ghs_amount) FILTER (WHERE transaction_type = 'withdrawal'), 0) AS aum_ghs,
-                SUM(usd_amount) FILTER (WHERE transaction_type = 'deposit') - 
-                    COALESCE(SUM(usd_amount) FILTER (WHERE transaction_type = 'withdrawal'), 0) AS aum_usd,
+                SUM(ghs_amount) FILTER (WHERE transaction_type IN ('deposit', 'direct_debit')) - 
+                    COALESCE(SUM(ghs_amount) FILTER (WHERE transaction_type = 'withdrawal' AND PN != 'Flex Dollar'), 0) AS aum_ghs,
+                SUM(usd_amount) FILTER (WHERE transaction_type IN ('deposit', 'direct_debit')) - 
+                    COALESCE(SUM(usd_amount) FILTER (WHERE transaction_type = 'withdrawal' AND PN != 'Flex Dollar'), 0) AS aum_usd,
 
                 -- Customer segmentation
-                COUNT(DISTINCT base_data.customer_id) FILTER (WHERE transaction_type = 'deposit') AS total_depositors,
-                COUNT(DISTINCT base_data.customer_id) FILTER (WHERE transaction_type = 'withdrawal') AS total_withdrawers,
+                COUNT(DISTINCT base_data.customer_id) FILTER (WHERE transaction_type IN ('deposit', 'direct_debit')) AS total_depositors,
+                COUNT(DISTINCT base_data.customer_id) FILTER (WHERE transaction_type = 'withdrawal' AND PN != 'Flex Dollar') AS total_withdrawers,
                 COUNT(DISTINCT ds.customer_id) FILTER (WHERE tx_days > 1) AS recurring_depositors,
                 COUNT(DISTINCT ds.customer_id) FILTER (WHERE tx_days = 1 AND DATE(first_deposit_date) BETWEEN :start_date AND :end_date) AS new_depositors,
 
                 -- Average transaction values
-                AVG(ghs_amount) FILTER (WHERE transaction_type = 'deposit') AS avg_deposit_value_ghs,
-                AVG(usd_amount) FILTER (WHERE transaction_type = 'deposit') AS avg_deposit_value_usd,
-                AVG(ghs_amount) FILTER (WHERE transaction_type = 'withdrawal') AS avg_withdrawal_value_ghs,
-                AVG(usd_amount) FILTER (WHERE transaction_type = 'withdrawal') AS avg_withdrawal_value_usd
+                AVG(ghs_amount) FILTER (WHERE transaction_type IN ('deposit', 'direct_debit')) AS avg_deposit_value_ghs,
+                AVG(usd_amount) FILTER (WHERE transaction_type IN ('deposit', 'direct_debit')) AS avg_deposit_value_usd,
+                AVG(ghs_amount) FILTER (WHERE transaction_type = 'withdrawal' AND PN != 'Flex Dollar') AS avg_withdrawal_value_ghs,
+                AVG(usd_amount) FILTER (WHERE transaction_type = 'withdrawal' AND PN != 'Flex Dollar') AS avg_withdrawal_value_usd
 
             FROM base_data
             LEFT JOIN depositors_summary ds USING (customer_id)
@@ -349,7 +314,7 @@ def load_general_metrics(start_date, end_date):
         logging.error("General metrics load failed: %s", str(e))
         st.error(f"Failed to load general metrics: {str(e)}")
         return pd.DataFrame()
-
+            
 def load_transaction_trend(start_date, end_date, granularity="month"):
     try:
         with engine.connect() as conn:
