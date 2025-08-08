@@ -1036,25 +1036,52 @@ elif page == "👥 User Information":
             with engine.connect() as conn:
                 query = f"""
                 WITH active_users AS (
-                    SELECT user_id FROM budgets WHERE created_at BETWEEN '{start_date}' AND '{end_date}'
+                    -- Spending feature: budgets
+                    SELECT DISTINCT user_id::TEXT AS user_id
+                    FROM budgets
+                    WHERE created_at BETWEEN '{start_date}' AND '{end_date}'
+                
                     UNION
-                    SELECT user_id FROM manual_and_external_transactions WHERE created_at BETWEEN '{start_date}' AND '{end_date}'
+                
+                    -- Spending feature: manual/external transactions
+                    SELECT DISTINCT user_id::TEXT AS user_id
+                    FROM manual_and_external_transactions
+                    WHERE created_at BETWEEN '{start_date}' AND '{end_date}'
+                
                     UNION
-                    SELECT user_id FROM investment_plans WHERE created_at BETWEEN '{start_date}' AND '{end_date}'
-                    UNION
-                    SELECT user_id FROM plans WHERE created_at BETWEEN '{start_date}' AND '{end_date}'
-                    UNION
-                    SELECT DISTINCT COALESCE(p.user_id, ip.user_id) AS user_id
+                
+                    -- Investments
+                    SELECT DISTINCT ip.user_id::TEXT AS user_id
                     FROM transactions t
-                    LEFT JOIN investment_plans ip ON ip.id = t.investment_plan_id
-                    LEFT JOIN plans p ON p.id = t.plan_id
-                    WHERE t.status = 'success' AND t.updated_at BETWEEN '{start_date}' AND '{end_date}'
+                    JOIN investment_plans ip ON ip.id = t.investment_plan_id
+                    WHERE t.status = 'success' 
+                      AND t.updated_at BETWEEN '{start_date}' AND '{end_date}'
+                
+                    UNION
+                
+                    -- Savings (stash)
+                    SELECT DISTINCT p.user_id::TEXT AS user_id
+                    FROM transactions t
+                    JOIN plans p ON p.id = t.plan_id
+                    WHERE t.status = 'success'
+                      AND t.updated_at BETWEEN '{start_date}' AND '{end_date}'
+                
+                    UNION
+                
+                    -- LADY AI usage
+                    SELECT DISTINCT "user"::TEXT AS user_id
+                    FROM slack_message_dump
+                    WHERE created_at BETWEEN '{start_date}' AND '{end_date}'
                 ),
+                
                 recent_activity AS (
-                    SELECT id FROM users WHERE DATE(most_recent_activity) BETWEEN '{start_date}' AND '{end_date}'
+                    SELECT id::TEXT AS user_id
+                    FROM users
+                    WHERE DATE(most_recent_activity) BETWEEN '{start_date}' AND '{end_date}'
                 )
+                
                 SELECT 
-                    u.id AS user_id,
+                    u.id::TEXT AS user_id,
                     u.gender,
                     u.country,
                     u.dob,
@@ -1062,12 +1089,12 @@ elif page == "👥 User Information":
                     u.ladder_use_option,
                     p.employment_status,
                     u.created_at,
-                    CASE WHEN ra.id IS NOT NULL THEN TRUE ELSE FALSE END AS is_recent,
+                    CASE WHEN ra.user_id IS NOT NULL THEN TRUE ELSE FALSE END AS is_recent,
                     CASE WHEN au.user_id IS NOT NULL THEN TRUE ELSE FALSE END AS is_active
                 FROM users u
                 LEFT JOIN profiles p ON p.user_id = u.id
-                LEFT JOIN recent_activity ra ON ra.id = u.id
-                LEFT JOIN active_users au ON au.user_id = u.id
+                LEFT JOIN recent_activity ra ON ra.user_id = u.id::TEXT
+                LEFT JOIN active_users au ON au.user_id = u.id::TEXT
                 WHERE u.created_at BETWEEN '{start_date}' AND '{end_date}';
                 """
                 return pd.read_sql(query, conn)
@@ -1168,3 +1195,4 @@ elif page == "👥 User Information":
         st.subheader("🧑 Employment Status")
         emp_counts = df['employment_status'].value_counts()
         st.plotly_chart(plot_bar(emp_counts, "Employment Status", "#e377c2"), use_container_width=True)
+
